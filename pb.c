@@ -1,5 +1,6 @@
 #include "pb.h"
 
+
 Arena arena_allocate(u64 capacity) {
   void* memory = mmap(0, capacity, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (memory == MAP_FAILED) {
@@ -80,6 +81,7 @@ inline void pb_memset(void* memory, u8 value, u64 size) {
   }
 }
 
-
-
+inline u64 pb_cycles() {
+  return __rdtsc();
+}
 

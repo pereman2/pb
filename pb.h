@@ -2,6 +2,9 @@
 #define PB_H
 
 #include <sys/mman.h>
+#include <sys/time.h>
+#include <x86intrin.h>
+
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -42,5 +45,6 @@ void arena_clear(Arena* arena);
 
 inline u64 pb_align(u64 value, u64 align);
 inline void pb_memset(void* memory, u8 value, u64 size);
+inline u64 pb_cycles();
 
 #endif // PB_H
