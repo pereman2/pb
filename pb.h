@@ -47,18 +47,18 @@ inline Arena* pb_allocator_arena_get(Allocator* allocator) {
         return (Arena*)allocator->ctx;
 }
 
-Arena arena_allocate(u64 capacity);
-void arena_release(Allocator* arena);
-void arena_set_auto_align(Allocator* arena, u64 align);
+Arena pb_arena_allocate(u64 capacity);
+void pb_arena_release(Allocator* arena);
+void pb_arena_set_auto_align(Allocator* arena, u64 align);
 
-u64 arena_pos(Allocator* arena);
+u64 pb_arena_pos(Allocator* arena);
 
-void* arena_push_no_zero(Allocator* arena, u64 size);
-void* arena_push_aligner(Allocator* arena, u64 align);
-void* arena_push(Allocator* arena, u64 size);
-void arena_pop_to(Allocator* arena, u64 pos);
-void arena_pop(Allocator* arena, void* memory_to);
-void arena_clear(Allocator* arena);
+void* pb_arena_push_no_zero(Allocator* arena, u64 size);
+void* pb_arena_push_aligner(Allocator* arena, u64 align);
+void* pb_arena_push(Allocator* arena, u64 size);
+void pb_arena_pop_to(Allocator* arena, u64 pos);
+void pb_arena_pop(Allocator* arena, void* memory_to);
+void pb_arena_clear(Allocator* arena);
 
 inline u64 pb_align(u64 value, u64 align);
 inline void pb_memset(void* memory, u8 value, u64 size);

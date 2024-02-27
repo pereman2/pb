@@ -14,18 +14,18 @@ void benchmark_unaligned() {
         u64 blocks[] = {64, 65, 128, 129};
 
         {
-                Arena arena = arena_allocate(total_memory);
+                Arena arena = pb_arena_allocate(total_memory);
                 u64 block_index = 0;
                 u64 amount = 0;
                 u64 start = pb_cycles();
                 while(amount < total_memory) {
-                        void* p = arena_push_no_zero(&arena, blocks[block_index]);
+                        void* p = pb_arena_push_no_zero(&arena, blocks[block_index]);
                         no_optimize(p);
                         amount += blocks[block_index];
                 }
                 u64 end = pb_cycles();
                 printf("%20s: %15llu\n", "Cycles arena", end - start);
-                arena_release(&arena);
+                pb_arena_release(&arena);
         }
 
         {
@@ -62,7 +62,6 @@ void verify() {
 
         // TODO(Pere): remove allocator
         // arena_release(&arena);
-
 }
 
 int main() {

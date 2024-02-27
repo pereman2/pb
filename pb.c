@@ -1,6 +1,6 @@
 #include "pb.h"
 
-Arena arena_allocate(u64 capacity) {
+Arena pb_arena_allocate(u64 capacity) {
         void* memory = mmap(0, capacity, PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (memory == MAP_FAILED) {
@@ -15,22 +15,22 @@ Arena arena_allocate(u64 capacity) {
         return arena;
 }
 
-void arena_release(Allocator* allocator) {
+void pb_arena_release(Allocator* allocator) {
         Arena* arena = pb_allocator_arena_get(allocator);
         munmap(arena, arena->capacity + sizeof(Arena));
 }
-void arena_set_auto_align(Allocator* allocator, u64 align) {
+void pb_arena_set_auto_align(Allocator* allocator, u64 align) {
         Arena* arena = pb_allocator_arena_get(allocator);
         pb_assert((align & (align - 1)) == 0);
         arena->auto_align = align;
 }
 
-u64 arena_pos(Allocator* allocator) { 
+u64 pb_arena_pos(Allocator* allocator) { 
         Arena* arena = pb_allocator_arena_get(allocator);
         return arena->pos; 
 }
 
-void* arena_push_no_zero(Allocator* allocator, u64 size) {
+void* pb_arena_push_no_zero(Allocator* allocator, u64 size) {
         Arena* arena = pb_allocator_arena_get(allocator);
         u64 align = arena->auto_align;
         if (align > 0) {
@@ -44,11 +44,11 @@ void* arena_push_no_zero(Allocator* allocator, u64 size) {
         return result;
 }
 
-void* arena_push_aligner(Allocator* allocator, u64 align) {
+void* pb_arena_push_aligner(Allocator* allocator, u64 align) {
         // ?
 }
 
-void* arena_push(Allocator* allocator, u64 size) {
+void* pb_arena_push(Allocator* allocator, u64 size) {
         Arena* arena = pb_allocator_arena_get(allocator);
         u64 align = arena->auto_align;
         if (align > 0) {
@@ -63,18 +63,18 @@ void* arena_push(Allocator* allocator, u64 size) {
         return result;
 }
 
-void arena_pop_to(Allocator* allocator, u64 pos) { 
+void pb_arena_pop_to(Allocator* allocator, u64 pos) { 
         Arena* arena = pb_allocator_arena_get(allocator);
         arena->pos = pos; 
 }
 
-void arena_pop(Allocator* allocator, void* memory_to) { 
+void pb_arena_pop(Allocator* allocator, void* memory_to) { 
         Arena* arena = pb_allocator_arena_get(allocator);
-        u64 size = (u64)memory_to - arena_pos(allocator);
+        u64 size = (u64)memory_to - pb_arena_pos(allocator);
         arena->pos -= size; 
 }
 
-void arena_clear(Allocator* allocator) { 
+void pb_arena_clear(Allocator* allocator) { 
         Arena* arena = pb_allocator_arena_get(allocator);
         arena->pos = 0; 
 }
@@ -113,9 +113,9 @@ Allocator pb_allocator_create(enum AllocatorType type, u64 capacity) {
                         allocator.set_auto_align = pb_sys_set_auto_align;
                         break;
                 case PB_ALLOCATOR_ARENA:
-                        allocator.allocate = arena_push;
-                        allocator.deallocate = arena_pop;
-                        allocator.set_auto_align = arena_set_auto_align;
+                        allocator.allocate = pb_arena_push;
+                        allocator.deallocate = pb_arena_pop;
+                        allocator.set_auto_align = pb_arena_set_auto_align;
                         break;
                 default:
                         pb_assert(0);
