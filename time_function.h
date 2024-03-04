@@ -1,5 +1,6 @@
 #pragma once
 
+#include <asm-generic/errno-base.h>
 #include <asm/unistd.h>
 #include <bits/types/FILE.h>
 #include <stdio.h>
@@ -18,7 +19,7 @@
 #define PROFILE_ASSERT(x) if (!(x)) { printf("assert failed %s %d\n", __FILE__, __LINE__); exit(EXIT_FAILURE); }
 
 #define PROFILE_TO_STDOUT 1
-#define PROFILE_MAX_THREADS 8192
+#define PROFILE_MAX_THREADS 1024
 #define PROFILE_MAX_ANCHORS 4096
 
 #ifdef __cplusplus
@@ -29,14 +30,46 @@ typedef std::atomic<uint64_t> atomic_uint64_t;
 typedef _Atomic uint64_t atomic_uint64_t;
 #endif
 
+struct ArenaRegion {
+  void* start;
+  void* end;
+  void* current;
+  ArenaRegion* next;
+};
+
+struct Arena {
+  ArenaRegion* regions;
+  ArenaRegion* current_region;
+  bool growable;
+};
+
+
+enum pb_profile_anchor_result_type {
+  PB_PROFILE_ANCHOR_CYCLES = 0,
+  PB_PROFILE_ANCHOR_HITS = 1,
+  PB_PROFILE_ANCHOR_CPU_MIGRATIONS = 2,
+  PB_PROFILE_ANCHOR_CACHE_MISSES = 3,
+  PB_PROFILE_ANCHOR_BRANCH_MISSES = 4,
+  PB_PROFILE_ANCHOR_LAST = 5,
+};
+
+struct pb_profile_anchor_result {
+  pb_profile_anchor_result_type type;
+  uint64_t value;
+};
+
+struct pb_profile_flush_header {
+  uint64_t thread_id;
+  uint64_t name_length;
+  uint64_t result_amount;
+};
+
 struct pb_profile_anchor {
   const char* name;
-  atomic_uint64_t elapsed[PROFILE_MAX_THREADS]; // 1 per thread, atomic because there could be multiple threads mapping to same bin hash function is not perfect
-  atomic_uint64_t hits[PROFILE_MAX_THREADS];
-  atomic_uint64_t cpu_migrations[PROFILE_MAX_THREADS];
-  atomic_uint64_t cache_misses[PROFILE_MAX_THREADS];
-  atomic_uint64_t branch_misses[PROFILE_MAX_THREADS];
+  pthread_mutex_t mutex[PROFILE_MAX_THREADS];
+  Arena* anchor_results_arena[PROFILE_MAX_THREADS];
 };
+
 
 enum pb_perf_event_type {
   PB_PERF_CACHE_MISSES = 0,
@@ -96,6 +129,115 @@ struct read_format {
 };
 /* End globals */
 
+static inline ArenaRegion* arena_region_create(size_t size) {
+  void* start = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (start == MAP_FAILED) {
+    return NULL;
+  }
+  ArenaRegion* arena_region = (ArenaRegion*)malloc(sizeof(ArenaRegion));
+  arena_region->start = start;
+  arena_region->end = (void*)((uintptr_t)start + size);
+  arena_region->current = start;
+  arena_region->next = NULL;
+  return arena_region;
+}
+
+static inline void arena_region_destroy(ArenaRegion* arena_region) {
+  munmap(arena_region->start, (uintptr_t)arena_region->end - (uintptr_t)arena_region->start);
+  free(arena_region);
+}
+
+static inline Arena* arena_create(size_t size, bool growable) {
+  void* start = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (start == MAP_FAILED) {
+    return NULL;
+  }
+  ArenaRegion* arena_region = arena_region_create(size);
+  Arena* arena = (Arena*)malloc(sizeof(Arena));
+
+  arena->growable = growable;
+  arena->regions = arena_region;
+  arena->current_region = arena_region;
+  return arena;
+}
+
+static inline void* arena_alloc(Arena* arena, size_t size) {
+  if (((uintptr_t)arena->current_region->current + size) > (uintptr_t)arena->current_region->end) {
+    if (!arena->growable) {
+      return NULL;
+    }
+    // Create a new region with fixed first size
+    ArenaRegion* new_region = arena_region_create((uintptr_t)arena->regions->end - (uintptr_t)arena->regions->start);
+    if (new_region == NULL) {
+      printf("Error: arena_region_create failed\n");
+      return NULL;
+    }
+    arena->current_region->next = new_region;
+    arena->current_region = new_region;
+  }
+
+  ArenaRegion* region = arena->current_region;
+  void* result = region->current;
+  region->current = (void*)((uintptr_t)region->current + size);
+  return result;
+}
+
+static inline void arena_destroy(Arena* arena) {
+  ArenaRegion* region = arena->regions;
+  while (region != NULL) {
+    ArenaRegion* next = region->next;
+    arena_region_destroy(region);
+    region = next;
+  }
+  free(arena);
+}
+
+static inline void pb_profile_anchor_thread_flush(pb_profile_anchor* anchor, uint64_t thread_id) {
+  pthread_mutex_lock(&pb_file_mutex_get());
+  Arena* arena = anchor->anchor_results_arena[thread_id];
+  //assert mutex is locked
+  PROFILE_ASSERT(pthread_mutex_trylock(&anchor->mutex[thread_id]) == EBUSY);
+  PROFILE_ASSERT(arena->growable == false);
+  FILE* log_file = *pb_profile_file_get();
+  uint64_t amount = (uintptr_t)arena->current_region->current - (uintptr_t)arena->current_region->start;
+  int ret;
+  if (amount > 0) {
+    pb_profile_flush_header header;
+    header.thread_id = thread_id;
+    header.name_length = strlen(anchor->name);
+    header.result_amount = amount;
+    printf("writing %lu bytes\n", amount);
+    ret = fwrite(&header, sizeof(pb_profile_flush_header), 1, log_file);
+    if (ret == 0) {
+      printf("Error: fprintf header failed\n");
+      exit(EXIT_FAILURE);
+    }
+    ret = fwrite(anchor->name, 1, header.name_length, log_file);
+    if (ret == 0) {
+      printf("Error: fprintf name failed\n");
+      exit(EXIT_FAILURE);
+    }
+    ret = fwrite(arena->current_region->start, 1, (uintptr_t)arena->current_region->current - (uintptr_t)arena->current_region->start, log_file);
+    if (ret == 0) {
+      printf("Error: fwrite flush failed\n");
+      exit(EXIT_FAILURE);
+    }
+  }
+  arena->current_region->current = arena->current_region->start;
+  pthread_mutex_unlock(&pb_file_mutex_get());
+}
+static inline void pb_profile_anchor_result_add(pb_profile_anchor* anchor, uint64_t thread_id, pb_profile_anchor_result_type type, uint64_t value) {
+  pthread_mutex_lock(&anchor->mutex[thread_id]);
+  Arena* arena = anchor->anchor_results_arena[thread_id];
+  pb_profile_anchor_result* result_ptr = (pb_profile_anchor_result*)arena_alloc(arena, sizeof(pb_profile_anchor_result));
+  if (result_ptr == NULL) {
+    pb_profile_anchor_thread_flush(anchor, thread_id);
+    result_ptr = (pb_profile_anchor_result*)arena_alloc(arena, sizeof(pb_profile_anchor_result));
+  }
+  result_ptr->type = type;
+  result_ptr->value = value;
+  pthread_mutex_unlock(&anchor->mutex[thread_id]);
+}
 
 static inline uint64_t pb_perf_event_read(pb_perf_event_type type) {
   int index = type;
@@ -241,28 +383,20 @@ class PbProfile {
       // TODO(pere): deal with overflow
       uint64_t count = pb_perf_event_read(PB_PERF_CACHE_MISSES);
       count -= start_cache;
-      g_profiler_get().anchors[index].cache_misses[thread_id] += count;
+      pb_profile_anchor_result_add(&g_profiler_get().anchors[index], thread_id, PB_PROFILE_ANCHOR_CACHE_MISSES, count);
     }
     if (flags & PB_PROFILE_BRANCH) {
       uint64_t count = pb_perf_event_read(PB_PERF_BRANCH_MISS);
       count -= start_branch;
-      g_profiler_get().anchors[index].branch_misses[thread_id] += count;
+      pb_profile_anchor_result_add(&g_profiler_get().anchors[index], thread_id, PB_PROFILE_ANCHOR_BRANCH_MISSES, count);
     }
 
     if (processor_id != end_processor_id) {
-      g_profiler_get().anchors[index].cpu_migrations[thread_id]++;
+    pb_profile_anchor_result_add(&g_profiler_get().anchors[index], thread_id, PB_PROFILE_ANCHOR_CPU_MIGRATIONS, elapsed);
       return;
     }
-    if (elapsed > 0 && g_profiler_get().anchors[index].elapsed[thread_id] > UINT64_MAX - elapsed) {
-      g_profiler_get().anchors[index].elapsed[thread_id] = elapsed;
-      // {
-      //   std::unique_lock<std::mutex> lock(pb_file_mutex_get());
-      //   pb_profile_file_get() << g_profiler_get().anchors[index].name << " cycles " << g_profiler_get().anchors[index].elapsed << " hits " << g_profiler_get().anchors[index].hits << std::endl;
-      // }
-    } else {
-      g_profiler_get().anchors[index].elapsed[thread_id] += elapsed;
-      g_profiler_get().anchors[index].hits[thread_id]++;
-    }
+    pb_profile_anchor_result_add(&g_profiler_get().anchors[index], thread_id, PB_PROFILE_ANCHOR_CYCLES, elapsed);
+    // g_profiler_get().anchors[index].hits[thread_id]++;
   }
 };
 
@@ -278,26 +412,27 @@ static void print_profiling() {
     uint64_t sum_migrations = 0;
     uint64_t sum_cache_misses = 0;
     uint64_t sum_branch_misses = 0;
+    // TODO(pere): lightweight mode to avoid huge files, deal here
     for (uint64_t j = 0; j < PROFILE_MAX_THREADS; j++) {
-      sum_elapsed += g_profiler_get().anchors[i].elapsed[j];
-      sum_hits += g_profiler_get().anchors[i].hits[j];
-      sum_migrations += g_profiler_get().anchors[i].cpu_migrations[j];
-      uint64_t count = g_profiler_get().anchors[i].cache_misses[j];
-      sum_cache_misses += g_profiler_get().anchors[i].cache_misses[j];
-      sum_branch_misses += g_profiler_get().anchors[i].branch_misses[j];
+      // sum_elapsed += g_profiler_get().anchors[i].elapsed[j];
+      // sum_hits += g_profiler_get().anchors[i].hits[j];
+      // sum_migrations += g_profiler_get().anchors[i].cpu_migrations[j];
+      // uint64_t count = g_profiler_get().anchors[i].cache_misses[j];
+      // sum_cache_misses += g_profiler_get().anchors[i].cache_misses[j];
+      // sum_branch_misses += g_profiler_get().anchors[i].branch_misses[j];
     }
     uint64_t avg_elapsed = 0;
     if (sum_hits > 0) {
       avg_elapsed = sum_elapsed / sum_hits;
     }
-    fprintf(*pb_profile_file_get(), "total_elapsed %lu\n", total_elapsed);
-    fprintf(*pb_profile_file_get(), "%s: ", g_profiler_get().anchors[i].name);
-    fprintf(*pb_profile_file_get(), "cycles=%lu ", sum_elapsed);
-    fprintf(*pb_profile_file_get(), "hits=%lu ", sum_hits);
-    fprintf(*pb_profile_file_get(), "cpu_migrations=%lu ", sum_migrations);
-    fprintf(*pb_profile_file_get(), "cache_misses=%lu ", sum_cache_misses);
-    fprintf(*pb_profile_file_get(), "branch_misses=%lu ", sum_branch_misses);
-    fprintf(*pb_profile_file_get(), "\n");
+    // fprintf(*pb_profile_file_get(), "total_elapsed %lu\n", total_elapsed);
+    // fprintf(*pb_profile_file_get(), "%s: ", g_profiler_get().anchors[i].name);
+    // fprintf(*pb_profile_file_get(), "cycles=%lu ", sum_elapsed);
+    // fprintf(*pb_profile_file_get(), "hits=%lu ", sum_hits);
+    // fprintf(*pb_profile_file_get(), "cpu_migrations=%lu ", sum_migrations);
+    // fprintf(*pb_profile_file_get(), "cache_misses=%lu ", sum_cache_misses);
+    // fprintf(*pb_profile_file_get(), "branch_misses=%lu ", sum_branch_misses);
+    // fprintf(*pb_profile_file_get(), "\n");
 #if PROFILE_TO_STDOUT == 1
     printf("%s: ", g_profiler_get().anchors[i].name);
     printf("cycles=%lu ", sum_elapsed);
@@ -315,7 +450,7 @@ static void* profile_thread_entry(void* ctx) {
   while (pb_is_profiling_get()) {
     sleep(1);
     printf("profiling\n");
-    print_profiling();
+    // print_profiling();
   }
   return NULL;
 }
@@ -348,7 +483,17 @@ static void pb_init_log_file(const char* filename) {
 static void pb_close_log_file() {
   pb_is_profiling_get() = false;
   pthread_join(*pb_profile_thread_get(), NULL);
-  print_profiling();
+  // print_profiling();
+  for ( uint64_t i = 0; i < PROFILE_MAX_ANCHORS; i++) {
+    for (uint64_t j = 0; j < PROFILE_MAX_THREADS; j++) {
+      pthread_mutex_lock(&g_profiler_get().anchors[i].mutex[j]);
+      pb_profile_anchor_thread_flush(&g_profiler_get().anchors[i], j);
+      pthread_mutex_unlock(&g_profiler_get().anchors[i].mutex[j]);
+
+      pthread_mutex_destroy(&g_profiler_get().anchors[i].mutex[j]);
+      arena_destroy(g_profiler_get().anchors[i].anchor_results_arena[j]);
+    }
+  }
   fclose(*pb_profile_file_get());
   *pb_profile_file_get() = NULL;
 }
@@ -357,12 +502,21 @@ static void pb_close_log_file() {
 class PbProfilerStart {
   public:
   PbProfilerStart(const char* filename) {
-    memset(&g_profiler_get(), 0, sizeof(pb_profiler));
-    memset(&g_profiler_get().anchors, 0, sizeof(pb_profile_anchor) * PROFILE_MAX_ANCHORS);
+    pb_profiler& profiler = g_profiler_get();
+    memset(&profiler, 0, sizeof(pb_profiler));
+    memset(&profiler.anchors, 0, sizeof(pb_profile_anchor) * PROFILE_MAX_ANCHORS);
+    for (uint64_t i = 0; i < PROFILE_MAX_ANCHORS; i++) {
+      for (uint64_t j = 0; j < PROFILE_MAX_THREADS; j++) {
+        pthread_mutex_init(&profiler.anchors[i].mutex[j], NULL);
+        profiler.anchors[i].anchor_results_arena[j] = arena_create(1024 * 1024, false);
+      }
+    }
     pb_init_log_file(filename); }
   ~PbProfilerStart() {
     pb_close_log_file();
   }
 };
 
+#ifndef PROFILE_MANUAL
 static PbProfilerStart pb_profiler_start("profile.log");
+#endif
