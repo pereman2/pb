@@ -51,7 +51,6 @@ struct pb_profile_perf_event {
   int initailized;
   int fd;
   perf_event_mmap_page* mmap;
-  uint64_t prev_value;
 };
 
 static thread_local pb_profile_perf_event pb_profile_perf_events[1024] = {{0}};
@@ -188,7 +187,7 @@ enum PbProfileFlags {
 
 class PbProfile {
   public:
-  uint64_t start;
+  uint64_t start, start_cache, start_branch;
   const char* function;
   uint64_t index;
   uint32_t processor_id;
@@ -208,7 +207,7 @@ class PbProfile {
         prev = 0;
         ioctl(pb_profile_perf_events[PB_PERF_CACHE_MISSES].fd, PERF_EVENT_IOC_RESET, 0);
       }
-      pb_profile_perf_events[PB_PERF_CACHE_MISSES].prev_value = prev;
+      start_cache = prev;
     }
 
     if (flags & PB_PROFILE_BRANCH) {
@@ -219,7 +218,7 @@ class PbProfile {
         prev = 0;
         ioctl(pb_profile_perf_events[PB_PERF_BRANCH_MISS].fd, PERF_EVENT_IOC_RESET, 0);
       }
-      pb_profile_perf_events[PB_PERF_BRANCH_MISS].prev_value = prev;
+      start_branch = prev;
     }
     
   }
@@ -241,12 +240,12 @@ class PbProfile {
     if (flags & PB_PROFILE_CACHE) {
       // TODO(pere): deal with overflow
       uint64_t count = pb_perf_event_read(PB_PERF_CACHE_MISSES);
-      count -= pb_profile_perf_events[PB_PERF_CACHE_MISSES].prev_value;
+      count -= start_cache;
       g_profiler_get().anchors[index].cache_misses[thread_id] += count;
     }
     if (flags & PB_PROFILE_BRANCH) {
       uint64_t count = pb_perf_event_read(PB_PERF_BRANCH_MISS);
-      count -= pb_profile_perf_events[PB_PERF_BRANCH_MISS].prev_value;
+      count -= start_branch;
       g_profiler_get().anchors[index].branch_misses[thread_id] += count;
     }
 
@@ -284,8 +283,6 @@ static void print_profiling() {
       sum_hits += g_profiler_get().anchors[i].hits[j];
       sum_migrations += g_profiler_get().anchors[i].cpu_migrations[j];
       uint64_t count = g_profiler_get().anchors[i].cache_misses[j];
-      if (count > 0)
-        printf("count thread %lu: %lu\n", j, count);
       sum_cache_misses += g_profiler_get().anchors[i].cache_misses[j];
       sum_branch_misses += g_profiler_get().anchors[i].branch_misses[j];
     }
