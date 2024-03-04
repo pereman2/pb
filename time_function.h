@@ -1,37 +1,41 @@
 #pragma once
 
-#include <atomic>
 #include <asm/unistd.h>
-#include <cstdint>
-#include <cstring>
+#include <bits/types/FILE.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
 #include <fcntl.h>
-#include <iostream>
 #include <linux/perf_event.h>
 #include <linux/hw_breakpoint.h>
-#include <map>
-#include <mutex>
 #include <pthread.h>
-#include <string>
 #include <sys/ioctl.h>
-#include <thread>
-#include <vector>
+#include <unistd.h>
 #include <x86intrin.h>
-#include <fstream>
 #include <sys/mman.h>
 #include <asm/unistd.h>
 
-#define PROFILE_ASSERT(x) if (!(x)) { std::cerr << "Assertion failed " << #x << std::endl; exit(EXIT_FAILURE); }
+#define PROFILE_ASSERT(x) if (!(x)) { printf("assert failed %s %d\n", __FILE__, __LINE__); exit(EXIT_FAILURE); }
 
+#define PROFILE_TO_STDOUT 1
 #define PROFILE_MAX_THREADS 8192
 #define PROFILE_MAX_ANCHORS 4096
 
+#ifdef __cplusplus
+#include <atomic>
+typedef std::atomic<uint64_t> atomic_uint64_t;
+#else
+#include <stdatomic.h>
+typedef _Atomic uint64_t atomic_uint64_t;
+#endif
+
 struct pb_profile_anchor {
   const char* name;
-  std::atomic_uint64_t elapsed[PROFILE_MAX_THREADS]; // 1 per thread, atomic because there could be multiple threads mapping to same bin hash function is not perfect
-  std::atomic_uint64_t hits[PROFILE_MAX_THREADS];
-  std::atomic_uint64_t cpu_migrations[PROFILE_MAX_THREADS];
-  std::atomic_uint64_t cache_misses[PROFILE_MAX_THREADS];
-  std::atomic_uint64_t branch_misses[PROFILE_MAX_THREADS];
+  atomic_uint64_t elapsed[PROFILE_MAX_THREADS]; // 1 per thread, atomic because there could be multiple threads mapping to same bin hash function is not perfect
+  atomic_uint64_t hits[PROFILE_MAX_THREADS];
+  atomic_uint64_t cpu_migrations[PROFILE_MAX_THREADS];
+  atomic_uint64_t cache_misses[PROFILE_MAX_THREADS];
+  atomic_uint64_t branch_misses[PROFILE_MAX_THREADS];
 };
 
 enum pb_perf_event_type {
@@ -60,17 +64,17 @@ struct pb_profiler {
 };
 
 /* Globals */
-inline std::mutex& pb_file_mutex_get() {
-  static std::mutex pb_file_mutex;
+inline pthread_mutex_t& pb_file_mutex_get() {
+  static pthread_mutex_t pb_file_mutex;
   return pb_file_mutex;
 }
-inline std::ofstream& pb_profile_file_get() {
-  static std::ofstream pb_profile_file;
-  return pb_profile_file;
+inline FILE** pb_profile_file_get() {
+  static FILE* pb_profile_file = NULL;
+  return &pb_profile_file;
 };
 
-inline std::thread** pb_profile_thread_get() {
-  static std::thread* pb_profile_thread = nullptr;
+inline pthread_t* pb_profile_thread_get() {
+  static pthread_t pb_profile_thread = 0;
   return &pb_profile_thread;
 };
 
@@ -155,17 +159,17 @@ inline void pb_perf_event_open(pb_perf_event_type type) {
         attr.config = PERF_COUNT_HW_BRANCH_MISSES;
         break;
       default:
-        std::cerr << "Invalid perf event type" << std::endl;
+        printf("Error: unknown perf event type %d\n", type);
         exit(EXIT_FAILURE);
     }
     pb_profile_perf_events[index].fd = syscall(__NR_perf_event_open, &attr, 0, -1, -1, 0);
     if (pb_profile_perf_events[index].fd == -1) {
-      std::cerr << "Error opening leader " << attr.config << std::endl;
+      printf("Error: perf_event_open failed for type %d\n", type);
       exit(EXIT_FAILURE);
     }
     pb_profile_perf_events[index].mmap = (perf_event_mmap_page*)mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, pb_profile_perf_events[index].fd, 0);
     if (pb_profile_perf_events[index].mmap == MAP_FAILED) {
-      std::cerr << "Error mapping file" << std::endl;
+      printf("Error: mmap failed for type %d\n", type);
       exit(EXIT_FAILURE);
     }
     ioctl(pb_profile_perf_events[index].fd, PERF_EVENT_IOC_RESET, 0);
@@ -264,8 +268,8 @@ class PbProfile {
 };
 
 static void print_profiling() {
+  PROFILE_ASSERT(*pb_profile_file_get() != NULL);
   uint64_t total_elapsed = __rdtsc() - g_profiler_get().start;
-  pb_profile_file_get() << "total_elapsed " << total_elapsed << std::endl;
   for (uint64_t i = 0; i < PROFILE_MAX_ANCHORS; i++) {
     if (g_profiler_get().anchors[i].name == nullptr) {
       continue;
@@ -282,29 +286,41 @@ static void print_profiling() {
       uint64_t count = g_profiler_get().anchors[i].cache_misses[j];
       if (count > 0)
         printf("count thread %lu: %lu\n", j, count);
-      sum_cache_misses += g_profiler_get().anchors[i].cache_misses[j].load();
+      sum_cache_misses += g_profiler_get().anchors[i].cache_misses[j];
       sum_branch_misses += g_profiler_get().anchors[i].branch_misses[j];
     }
     uint64_t avg_elapsed = 0;
     if (sum_hits > 0) {
       avg_elapsed = sum_elapsed / sum_hits;
     }
-    pb_profile_file_get() << g_profiler_get().anchors[i].name << " cycles " << sum_elapsed 
-      << " hits " << sum_hits << " avg_elapsed " << avg_elapsed 
-      << " cpu_migrations " << sum_migrations 
-      << " cache_misses " << sum_cache_misses 
-      << " branch_misses " << sum_branch_misses 
-      << std::endl;
+    fprintf(*pb_profile_file_get(), "total_elapsed %lu\n", total_elapsed);
+    fprintf(*pb_profile_file_get(), "%s: ", g_profiler_get().anchors[i].name);
+    fprintf(*pb_profile_file_get(), "cycles=%lu ", sum_elapsed);
+    fprintf(*pb_profile_file_get(), "hits=%lu ", sum_hits);
+    fprintf(*pb_profile_file_get(), "cpu_migrations=%lu ", sum_migrations);
+    fprintf(*pb_profile_file_get(), "cache_misses=%lu ", sum_cache_misses);
+    fprintf(*pb_profile_file_get(), "branch_misses=%lu ", sum_branch_misses);
+    fprintf(*pb_profile_file_get(), "\n");
+#if PROFILE_TO_STDOUT == 1
+    printf("%s: ", g_profiler_get().anchors[i].name);
+    printf("cycles=%lu ", sum_elapsed);
+    printf("hits=%lu ", sum_hits);
+    printf("cpu_migrations=%lu ", sum_migrations);
+    printf("cache_misses=%lu ", sum_cache_misses);
+    printf("branch_misses=%lu ", sum_branch_misses);
+    printf("\n");
+#endif
 
   }
 }
 
-static void profile_thread_entry() {
+static void* profile_thread_entry(void* ctx) {
   while (pb_is_profiling_get()) {
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-    std::cout << "profiling" << std::endl;
+    sleep(1);
+    printf("profiling\n");
     print_profiling();
   }
+  return NULL;
 }
 
 
@@ -314,30 +330,36 @@ static void profile_thread_entry() {
 #define PbProfileFunctionF(variable, label, flags) PbProfile variable((const char*)label, (uint64_t)(__COUNTER__ + 1), flags)
 
 
-static void pb_init_log_file(const std::string& filename) {
+static void pb_init_log_file(const char* filename) {
   g_profiler_get().start = __rdtsc();
   pb_is_profiling_get() = true;
-  pb_profile_file_get().open(filename, std::ios::out | std::ios::app); // Open in append mode
-  if (!pb_profile_file_get().is_open()) {
-    throw std::runtime_error("Failed to open log profile_file: " + filename);
+  if (*pb_profile_file_get() == NULL) {
+    (*pb_profile_file_get()) = fopen(filename, "w");
+    if (pb_profile_file_get() == NULL) {
+      printf("Error: fopen() failed log file %s\n", filename);
+      exit(EXIT_FAILURE);
+    }
   }
-  *pb_profile_thread_get() = new std::thread(profile_thread_entry);
+  int ret = pthread_create(pb_profile_thread_get(), NULL, profile_thread_entry, NULL);
+  if (ret != 0) {
+    printf("Error: pthread_create() failed\n");
+    exit(EXIT_FAILURE);
+  }
 }
 
 // Static method to close the log profile_file
 static void pb_close_log_file() {
   pb_is_profiling_get() = false;
-  (*pb_profile_thread_get())->join();
+  pthread_join(*pb_profile_thread_get(), NULL);
   print_profiling();
-  if (pb_profile_file_get().is_open()) {
-    pb_profile_file_get().close();
-  }
+  fclose(*pb_profile_file_get());
+  *pb_profile_file_get() = NULL;
 }
 
 
 class PbProfilerStart {
   public:
-  PbProfilerStart(const std::string& filename) {
+  PbProfilerStart(const char* filename) {
     memset(&g_profiler_get(), 0, sizeof(pb_profiler));
     memset(&g_profiler_get().anchors, 0, sizeof(pb_profile_anchor) * PROFILE_MAX_ANCHORS);
     pb_init_log_file(filename); }
