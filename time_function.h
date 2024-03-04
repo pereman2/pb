@@ -17,6 +17,10 @@
 #include <vector>
 #include <x86intrin.h>
 #include <fstream>
+#include <sys/mman.h>
+#include <asm/unistd.h>
+
+#define PROFILE_ASSERT(x) if (!(x)) { std::cerr << "Assertion failed " << #x << std::endl; exit(EXIT_FAILURE); }
 
 #define PROFILE_MAX_THREADS 8192
 #define PROFILE_MAX_ANCHORS 4096
@@ -27,7 +31,7 @@ struct pb_profile_anchor {
   std::atomic_uint64_t hits[PROFILE_MAX_THREADS];
   std::atomic_uint64_t cpu_migrations[PROFILE_MAX_THREADS];
   std::atomic_uint64_t cache_misses[PROFILE_MAX_THREADS];
-  std::atomic_uint64_t page_faults[PROFILE_MAX_THREADS];
+  std::atomic_uint64_t branch_misses[PROFILE_MAX_THREADS];
 };
 
 enum pb_perf_event_type {
@@ -36,9 +40,17 @@ enum pb_perf_event_type {
   PB_PERF_INSTRUCTIONS = 2,
   PB_PERF_CYCLES = 3,
   PB_PERF_PAGE_FAULTS = 4,
+  PB_PERF_BRANCH_MISS = 5,
 };
 
-static thread_local int pb_profile_perf_event_fds[1024] = {-1};
+struct pb_profile_perf_event {
+  int initailized;
+  int fd;
+  perf_event_mmap_page* mmap;
+  uint64_t prev_value;
+};
+
+static thread_local pb_profile_perf_event pb_profile_perf_events[1024] = {{0}};
 
 struct pb_profiler {
   pb_profile_anchor anchors[PROFILE_MAX_ANCHORS];
@@ -81,15 +93,42 @@ struct read_format {
 };
 /* End globals */
 
-inline void pb_perf_event_open(int type) {
+
+static inline uint64_t pb_perf_event_read(pb_perf_event_type type) {
   int index = type;
-  if (pb_profile_perf_event_fds[index] == -1) {
+  perf_event_mmap_page* buf = pb_profile_perf_events[index].mmap;
+  PROFILE_ASSERT(buf != NULL);
+  uint32_t seq;
+  uint64_t count;
+  uint64_t offset;
+
+  do {
+		seq = buf->lock;
+		// rmb();
+		index = buf->index;
+		offset = buf->offset;
+		if (index == 0) { /* rdpmc not allowed */
+			count = 0;
+			break;
+		}
+		count = _rdpmc(index - 1);
+		// rmb();
+  } while (buf->lock != seq);
+
+	return (count + offset) & 0xffffffffffff;
+  return count;
+}
+
+inline void pb_perf_event_open(pb_perf_event_type type) {
+  int index = type;
+  if (pb_profile_perf_events[index].initailized == 0) {
     perf_event_attr attr;
     memset(&attr, 0, sizeof(perf_event_attr));
     attr.size = sizeof(perf_event_attr);
     attr.disabled = 1;
     attr.exclude_kernel = 1;
     attr.exclude_hv = 1;
+    attr.mmap = 1;
     switch (type) {
       case PB_PERF_CACHE_MISSES:
         attr.type = PERF_TYPE_HARDWARE;
@@ -111,15 +150,27 @@ inline void pb_perf_event_open(int type) {
         attr.type = PERF_TYPE_SOFTWARE;
         attr.config = PERF_COUNT_SW_PAGE_FAULTS;
         break;
+      case PB_PERF_BRANCH_MISS:
+        attr.type = PERF_TYPE_HARDWARE;
+        attr.config = PERF_COUNT_HW_BRANCH_MISSES;
+        break;
       default:
         std::cerr << "Invalid perf event type" << std::endl;
         exit(EXIT_FAILURE);
     }
-    pb_profile_perf_event_fds[index] = syscall(__NR_perf_event_open, &attr, 0, -1, -1, 0);
-    if (pb_profile_perf_event_fds[index] == -1) {
+    pb_profile_perf_events[index].fd = syscall(__NR_perf_event_open, &attr, 0, -1, -1, 0);
+    if (pb_profile_perf_events[index].fd == -1) {
       std::cerr << "Error opening leader " << attr.config << std::endl;
       exit(EXIT_FAILURE);
     }
+    pb_profile_perf_events[index].mmap = (perf_event_mmap_page*)mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, pb_profile_perf_events[index].fd, 0);
+    if (pb_profile_perf_events[index].mmap == MAP_FAILED) {
+      std::cerr << "Error mapping file" << std::endl;
+      exit(EXIT_FAILURE);
+    }
+    ioctl(pb_profile_perf_events[index].fd, PERF_EVENT_IOC_RESET, 0);
+    ioctl(pb_profile_perf_events[index].fd, PERF_EVENT_IOC_ENABLE);
+    pb_profile_perf_events[index].initailized = 1;
   }
 } 
 
@@ -128,7 +179,7 @@ enum PbProfileFlags {
   PB_PROFILE_PAGE_FAULTS = 2,
   PB_PROFILE_INSTRUCTIONS = 4,
   PB_PROFILE_CYCLES = 8,
-  PB_PROFILE_ALL = 15,
+  PB_PROFILE_BRANCH = 16,
 };
 
 class PbProfile {
@@ -148,31 +199,51 @@ class PbProfile {
 
     if (flags & PB_PROFILE_CACHE) {
       pb_perf_event_open(PB_PERF_CACHE_MISSES);
-      ioctl(pb_profile_perf_event_fds[PB_PERF_CACHE_MISSES], PERF_EVENT_IOC_RESET, 0);
-      ioctl(pb_profile_perf_event_fds[PB_PERF_CACHE_MISSES], PERF_EVENT_IOC_ENABLE);
+      uint64_t prev = pb_perf_event_read(PB_PERF_CACHE_MISSES);
+      if (prev > UINT64_MAX / 2) {
+        prev = 0;
+        ioctl(pb_profile_perf_events[PB_PERF_CACHE_MISSES].fd, PERF_EVENT_IOC_RESET, 0);
+      }
+      pb_profile_perf_events[PB_PERF_CACHE_MISSES].prev_value = prev;
     }
 
-    if (flags & PB_PROFILE_PAGE_FAULTS) {
-      pb_perf_event_open(PB_PERF_PAGE_FAULTS);
-      ioctl(pb_profile_perf_event_fds[PB_PERF_PAGE_FAULTS], PERF_EVENT_IOC_RESET, 0);
-      ioctl(pb_profile_perf_event_fds[PB_PERF_PAGE_FAULTS], PERF_EVENT_IOC_ENABLE);
+    if (flags & PB_PROFILE_BRANCH) {
+      pb_perf_event_open(PB_PERF_BRANCH_MISS);
+      uint64_t prev = pb_perf_event_read(PB_PERF_BRANCH_MISS);
+      if (prev > UINT64_MAX / 2) {
+        printf("too bigg\n");
+        prev = 0;
+        ioctl(pb_profile_perf_events[PB_PERF_BRANCH_MISS].fd, PERF_EVENT_IOC_RESET, 0);
+      }
+      pb_profile_perf_events[PB_PERF_BRANCH_MISS].prev_value = prev;
     }
     
   }
 
+  inline uint64_t hash_thread_id() {
+    uint64_t thread_id = pthread_self();
+    for (uint64_t i = 0; i < sizeof(thread_id); i++) {
+      thread_id = (thread_id << 7) ^ (thread_id >> 3);
+    }
+    return thread_id % PROFILE_MAX_THREADS;
+  }
+
+
   ~PbProfile() {
     uint32_t end_processor_id;
     uint64_t elapsed = __rdtscp(&end_processor_id) - start;
-    uint64_t thread_id = pthread_self() % 8192; // seems like a good number
+    uint64_t thread_id = hash_thread_id();
 
-    read_format perf_read;
     if (flags & PB_PROFILE_CACHE) {
-      read(pb_profile_perf_event_fds[PB_PERF_CACHE_MISSES], &perf_read, sizeof(read_format));
-      g_profiler_get().anchors[index].cache_misses[thread_id] += perf_read.value;
+      // TODO(pere): deal with overflow
+      uint64_t count = pb_perf_event_read(PB_PERF_CACHE_MISSES);
+      count -= pb_profile_perf_events[PB_PERF_CACHE_MISSES].prev_value;
+      g_profiler_get().anchors[index].cache_misses[thread_id] += count;
     }
-    if (flags & PB_PROFILE_PAGE_FAULTS) {
-      read(pb_profile_perf_event_fds[PB_PERF_PAGE_FAULTS], &perf_read, sizeof(read_format));
-      g_profiler_get().anchors[index].page_faults[thread_id] += perf_read.value;
+    if (flags & PB_PROFILE_BRANCH) {
+      uint64_t count = pb_perf_event_read(PB_PERF_BRANCH_MISS);
+      count -= pb_profile_perf_events[PB_PERF_BRANCH_MISS].prev_value;
+      g_profiler_get().anchors[index].branch_misses[thread_id] += count;
     }
 
     if (processor_id != end_processor_id) {
@@ -203,13 +274,16 @@ static void print_profiling() {
     uint64_t sum_hits = 0;
     uint64_t sum_migrations = 0;
     uint64_t sum_cache_misses = 0;
-    uint64_t sum_page_faults = 0;
+    uint64_t sum_branch_misses = 0;
     for (uint64_t j = 0; j < PROFILE_MAX_THREADS; j++) {
       sum_elapsed += g_profiler_get().anchors[i].elapsed[j];
       sum_hits += g_profiler_get().anchors[i].hits[j];
       sum_migrations += g_profiler_get().anchors[i].cpu_migrations[j];
-      sum_cache_misses += g_profiler_get().anchors[i].cache_misses[j];
-      sum_page_faults += g_profiler_get().anchors[i].page_faults[j];
+      uint64_t count = g_profiler_get().anchors[i].cache_misses[j];
+      if (count > 0)
+        printf("count thread %lu: %lu\n", j, count);
+      sum_cache_misses += g_profiler_get().anchors[i].cache_misses[j].load();
+      sum_branch_misses += g_profiler_get().anchors[i].branch_misses[j];
     }
     uint64_t avg_elapsed = 0;
     if (sum_hits > 0) {
@@ -219,7 +293,7 @@ static void print_profiling() {
       << " hits " << sum_hits << " avg_elapsed " << avg_elapsed 
       << " cpu_migrations " << sum_migrations 
       << " cache_misses " << sum_cache_misses 
-      << " page_faults " << sum_page_faults 
+      << " branch_misses " << sum_branch_misses 
       << std::endl;
 
   }
@@ -265,6 +339,7 @@ class PbProfilerStart {
   public:
   PbProfilerStart(const std::string& filename) {
     memset(&g_profiler_get(), 0, sizeof(pb_profiler));
+    memset(&g_profiler_get().anchors, 0, sizeof(pb_profile_anchor) * PROFILE_MAX_ANCHORS);
     pb_init_log_file(filename); }
   ~PbProfilerStart() {
     pb_close_log_file();
