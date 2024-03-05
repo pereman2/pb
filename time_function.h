@@ -503,6 +503,8 @@ class PbProfilerStart {
   public:
   PbProfilerStart(const char* filename) {
     pb_profiler& profiler = g_profiler_get();
+    char buffer[1024];
+    sprintf(buffer, "%d-%s", getpid(), filename);
     memset(&profiler, 0, sizeof(pb_profiler));
     memset(&profiler.anchors, 0, sizeof(pb_profile_anchor) * PROFILE_MAX_ANCHORS);
     for (uint64_t i = 0; i < PROFILE_MAX_ANCHORS; i++) {
@@ -511,12 +513,12 @@ class PbProfilerStart {
         profiler.anchors[i].anchor_results_arena[j] = arena_create(1024 * 1024, false);
       }
     }
-    pb_init_log_file(filename); }
+    pb_init_log_file(buffer); }
   ~PbProfilerStart() {
     pb_close_log_file();
   }
 };
 
 #ifndef PROFILE_MANUAL
-static PbProfilerStart pb_profiler_start("profile.log");
+static PbProfilerStart pb_profiler_start("profile.log"); // includes pid in filename
 #endif
