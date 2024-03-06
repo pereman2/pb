@@ -25,8 +25,8 @@ const char* pb_profile_anchor_type_to_string(pb_profile_anchor_result_type type)
   return "unknown";
 }
 
-void parse_stats() {
-  FILE* file = fopen("profile.log", "r");
+void parse_stats(const char* filename) {
+  FILE* file = fopen(filename, "r");
   if (file == NULL) {
     printf("Error: file not found\n");
     return;
@@ -38,14 +38,14 @@ void parse_stats() {
   int ret;
   std::map<std::string, std::vector<std::vector<uint64_t>>> per_function_results;
   while (fread(&header, sizeof(pb_profile_flush_header), 1, file) == 1) {
-    printf("Thread %lu amount %lu ", header.thread_id, header.result_amount);
+    // printf("Thread %lu amount %lu ", header.thread_id, header.result_amount);
     char* function = (char*)arena_alloc(arena, header.name_length);
     ret = fread(function, 1, header.name_length, file);
     if (ret != header.name_length) {
       printf("Error: could not read function %d\n", ret);
       break;
     }
-    printf("Function %s:\n", function);
+    // printf("Function %s:\n", function);
 
     char* results_raw = (char*)arena_alloc(arena, header.result_amount);
     ret = fread(results_raw, 1, header.result_amount, file);
@@ -60,7 +60,7 @@ void parse_stats() {
     for (int i = 0; i < header.result_amount / sizeof(pb_profile_anchor_result); i++) {
       result = results[i];
       per_function_results[function][result.type].push_back(result.value);
-      printf("  %s: %lu\n", pb_profile_anchor_type_to_string(result.type), result.value);
+      // printf("  %s: %lu\n", pb_profile_anchor_type_to_string(result.type), result.value);
     }
   }
 
@@ -105,7 +105,16 @@ void parse_stats() {
   arena_destroy(arena);
 }
 
-int main() {
-  parse_stats();
+int main(int argc, char** argv) {
+  int child_pid = fork();
+  if (child_pid < 0) {
+    printf("Error: could not fork\n");
+    return 0;
+  }
+  if (argc != 2) {
+    printf("Usage: %s <profile.log>\n", argv[0]);
+    return 1;
+  }
+  parse_stats(argv[1]);
   return 0;
 }
