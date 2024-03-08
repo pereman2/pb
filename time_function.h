@@ -20,7 +20,7 @@
 
 #define PROFILE_TO_STDOUT 1
 #define PROFILE_MAX_THREADS 1024
-#define PROFILE_MAX_ANCHORS 4096
+#define PROFILE_MAX_ANCHORS 1024
 
 #ifdef __cplusplus
 #include <atomic>
@@ -89,7 +89,7 @@ struct pb_profile_perf_event {
 static thread_local pb_profile_perf_event pb_profile_perf_events[1024] = {{0}};
 
 struct pb_profiler {
-  pb_profile_anchor anchors[PROFILE_MAX_ANCHORS];
+  pb_profile_anchor* anchors;
   uint64_t anchor_count;
   uint64_t start;
   uint64_t total_elapsed;
@@ -129,6 +129,9 @@ struct read_format {
 };
 /* End globals */
 
+static inline uint64_t arena_region_size(ArenaRegion* region) {
+  return (uintptr_t)region->end - (uintptr_t)region->start;
+}
 static inline ArenaRegion* arena_region_create(size_t size) {
   void* start = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (start == MAP_FAILED) {
@@ -162,9 +165,14 @@ static inline Arena* arena_create(size_t size, bool growable) {
 }
 
 static inline void* arena_alloc(Arena* arena, size_t size) {
-  if (((uintptr_t)arena->current_region->current + size) > (uintptr_t)arena->current_region->end) {
+  uint64_t amount = (uintptr_t)arena->current_region->current + size;
+  if (amount > (uintptr_t)arena->current_region->end) {
     if (!arena->growable) {
       return NULL;
+    }
+    uint64_t new_size = arena_region_size(arena->current_region);
+    if (amount > new_size) {
+      new_size = amount;
     }
     // Create a new region with fixed first size
     ArenaRegion* new_region = arena_region_create((uintptr_t)arena->regions->end - (uintptr_t)arena->regions->start);
@@ -481,17 +489,18 @@ static void pb_init_log_file(const char* filename) {
 
 // Static method to close the log profile_file
 static void pb_close_log_file() {
+  pb_profiler &profiler = g_profiler_get();
   pb_is_profiling_get() = false;
   pthread_join(*pb_profile_thread_get(), NULL);
   // print_profiling();
   for ( uint64_t i = 0; i < PROFILE_MAX_ANCHORS; i++) {
     for (uint64_t j = 0; j < PROFILE_MAX_THREADS; j++) {
-      pthread_mutex_lock(&g_profiler_get().anchors[i].mutex[j]);
-      pb_profile_anchor_thread_flush(&g_profiler_get().anchors[i], j);
-      pthread_mutex_unlock(&g_profiler_get().anchors[i].mutex[j]);
+      pthread_mutex_lock(&profiler.anchors[i].mutex[j]);
+      pb_profile_anchor_thread_flush(&profiler.anchors[i], j);
+      pthread_mutex_unlock(&profiler.anchors[i].mutex[j]);
 
-      pthread_mutex_destroy(&g_profiler_get().anchors[i].mutex[j]);
-      arena_destroy(g_profiler_get().anchors[i].anchor_results_arena[j]);
+      pthread_mutex_destroy(&profiler.anchors[i].mutex[j]);
+      arena_destroy(profiler.anchors[i].anchor_results_arena[j]);
     }
   }
   fclose(*pb_profile_file_get());
@@ -500,13 +509,24 @@ static void pb_close_log_file() {
 
 
 class PbProfilerStart {
+  Arena* profiler_arena;
   public:
   PbProfilerStart(const char* filename) {
     pb_profiler& profiler = g_profiler_get();
     char buffer[1024];
+    profiler_arena = arena_create(sizeof(pb_profile_anchor) * PROFILE_MAX_ANCHORS, true);
+    if (profiler_arena == NULL) {
+      printf("Error: arena_create failed\n");
+      exit(EXIT_FAILURE);
+    }
     sprintf(buffer, "%d-%s", getpid(), filename);
     memset(&profiler, 0, sizeof(pb_profiler));
-    memset(&profiler.anchors, 0, sizeof(pb_profile_anchor) * PROFILE_MAX_ANCHORS);
+    profiler.anchors = (pb_profile_anchor*)arena_alloc(profiler_arena, sizeof(pb_profile_anchor) * PROFILE_MAX_ANCHORS);
+    if (profiler.anchors == NULL) {
+      printf("Error: arena_alloc anchors failed\n");
+      exit(EXIT_FAILURE);
+    }
+    memset(profiler.anchors, 0, sizeof(pb_profile_anchor) * PROFILE_MAX_ANCHORS);
     for (uint64_t i = 0; i < PROFILE_MAX_ANCHORS; i++) {
       for (uint64_t j = 0; j < PROFILE_MAX_THREADS; j++) {
         pthread_mutex_init(&profiler.anchors[i].mutex[j], NULL);
@@ -516,6 +536,7 @@ class PbProfilerStart {
     pb_init_log_file(buffer); }
   ~PbProfilerStart() {
     pb_close_log_file();
+    arena_destroy(profiler_arena);
   }
 };
 
