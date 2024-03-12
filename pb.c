@@ -58,6 +58,7 @@ void* pb_arena_push(Allocator* allocator, u64 size) {
         }
 
         void* result = arena->memory + arena->pos;
+        pb_assert(arena->pos + size < arena->capacity);
         arena->pos += size;
         pb_memset(result, 0, size);
         return result;
@@ -66,6 +67,9 @@ void* pb_arena_push(Allocator* allocator, u64 size) {
 void pb_arena_pop_to(Allocator* allocator, u64 pos) { 
         Arena* arena = pb_allocator_arena_get(allocator);
         arena->pos = pos; 
+}
+
+void pb_arena_deallocate(Allocator* allocator, void* memory_to) { 
 }
 
 void pb_arena_pop(Allocator* allocator, void* memory_to) { 
@@ -114,8 +118,9 @@ Allocator pb_allocator_create(enum AllocatorType type, u64 capacity) {
                         break;
                 case PB_ALLOCATOR_ARENA:
                         allocator.allocate = pb_arena_push;
-                        allocator.deallocate = pb_arena_pop;
+                        allocator.deallocate = pb_arena_deallocate;
                         allocator.set_auto_align = pb_arena_set_auto_align;
+                        allocator.ctx.arena = pb_arena_allocate(capacity);
                         break;
                 default:
                         pb_assert(0);

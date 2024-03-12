@@ -43,7 +43,9 @@ void benchmark_unaligned() {
         }
 }
 
-void verify() {
+#define PRINT_TEST_OK() printf("Test OK %s\n", __FUNCTION__)
+
+void test_arena() {
         Allocator allocator = pb_allocator_create(PB_ALLOCATOR_ARENA, 1024);
         Arena* arena = pb_allocator_arena_get(&allocator);
 
@@ -62,9 +64,25 @@ void verify() {
 
         // TODO(Pere): remove allocator
         // arena_release(&arena);
+        PRINT_TEST_OK();
+}
+
+void test_array() {
+        Allocator allocator_array = pb_allocator_create(PB_ALLOCATOR_ARENA, 1024*1024*1024);
+        DynamicArray(int) array;
+        pb_dynamic_array_init(array, &allocator_array, 8);
+
+        for (int i = 0; i < 100; i++) {
+          pb_dynamic_array_push(array, i);
+        }
+        for (int i = 0; i < 100; i++) {
+          pb_assert(array[i] == i);
+        }
+        PRINT_TEST_OK();
 }
 
 int main() {
-        verify();
+        test_arena();
+        test_array();
         // benchmark_unaligned();
 }
