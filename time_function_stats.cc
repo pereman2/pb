@@ -25,7 +25,45 @@ const char* pb_profile_anchor_type_to_string(pb_profile_anchor_result_type type)
   return "unknown";
 }
 
-void parse_stats(const char* filename) {
+void print_results(const char* function, std::map<std::string, std::vector<std::vector<uint64_t>>> &per_function_results) {
+  auto stdev = [](std::vector<uint64_t>& values) {
+    uint64_t sum = 0;
+    for (int i = 0; i < values.size(); i++) {
+      sum += values[i];
+    }
+    uint64_t mean = sum / values.size();
+    uint64_t sum_of_squares = 0;
+    for (int i = 0; i < values.size(); i++) {
+      sum_of_squares += (values[i] - mean) * (values[i] - mean);
+    }
+    return sqrt(sum_of_squares / values.size());
+  };
+
+  auto p99 = [](std::vector<uint64_t>& values) {
+    return values[values.size() * 99 / 100];
+  };
+
+  printf("Results %s:\n", function);
+  for (auto it = per_function_results.begin(); it != per_function_results.end(); it++) {
+    printf("Function %s:\n", it->first.c_str());
+    for (int i = 0; i < PB_PROFILE_ANCHOR_LAST; i++) {
+      if (it->second[i].size() > 0) {
+        std::sort(it->second[i].begin(), it->second[i].end());
+        uint64_t sum = 0;
+        for (int j = 0; j < it->second[i].size(); j++) {
+          sum += it->second[i][j];
+        }
+        printf("  %20s: samples: %20lu, avg: %20lu stdev %20f p99 %20lu\n", 
+            pb_profile_anchor_type_to_string((pb_profile_anchor_result_type)i), 
+            it->second[i].size(), 
+            sum / it->second[i].size(), 
+            stdev(it->second[i]),
+            p99(it->second[i]));
+      }
+    }
+  }
+}
+void parse_stats(const char* filename, std::map<std::string, std::vector<std::vector<uint64_t>>> &per_function_results_all) {
   FILE* file = fopen(filename, "r");
   if (file == NULL) {
     printf("Error: file not found\n");
@@ -64,40 +102,14 @@ void parse_stats(const char* filename) {
     }
   }
 
-  auto stdev = [](std::vector<uint64_t>& values) {
-    uint64_t sum = 0;
-    for (int i = 0; i < values.size(); i++) {
-      sum += values[i];
-    }
-    uint64_t mean = sum / values.size();
-    uint64_t sum_of_squares = 0;
-    for (int i = 0; i < values.size(); i++) {
-      sum_of_squares += (values[i] - mean) * (values[i] - mean);
-    }
-    return sqrt(sum_of_squares / values.size());
-  };
+  print_results(filename, per_function_results);
 
-  auto p99 = [](std::vector<uint64_t>& values) {
-    return values[values.size() * 99 / 100];
-  };
-
-  printf("\nResults:\n");
-  for (auto it = per_function_results.begin(); it != per_function_results.end(); it++) {
-    printf("Function %s:\n", it->first.c_str());
+  for (auto &function_results : per_function_results) {
+    if (per_function_results_all.find(function_results.first) == per_function_results_all.end()) {
+      per_function_results_all[function_results.first] = std::vector<std::vector<uint64_t>>(PB_PROFILE_ANCHOR_LAST);
+    }
     for (int i = 0; i < PB_PROFILE_ANCHOR_LAST; i++) {
-      if (it->second[i].size() > 0) {
-        std::sort(it->second[i].begin(), it->second[i].end());
-        uint64_t sum = 0;
-        for (int j = 0; j < it->second[i].size(); j++) {
-          sum += it->second[i][j];
-        }
-        printf("  %20s: samples: %20lu, avg: %20lu stdev %20f p99 %20lu\n", 
-            pb_profile_anchor_type_to_string((pb_profile_anchor_result_type)i), 
-            it->second[i].size(), 
-            sum / it->second[i].size(), 
-            stdev(it->second[i]),
-            p99(it->second[i]));
-      }
+      per_function_results_all[function_results.first][i].insert(per_function_results_all[function_results.first][i].end(), function_results.second[i].begin(), function_results.second[i].end());
     }
   }
   fclose(file);
@@ -106,15 +118,14 @@ void parse_stats(const char* filename) {
 }
 
 int main(int argc, char** argv) {
-  int child_pid = fork();
-  if (child_pid < 0) {
-    printf("Error: could not fork\n");
-    return 0;
-  }
-  if (argc != 2) {
-    printf("Usage: %s <profile.log>\n", argv[0]);
+  if (argc < 2) {
+    printf("Usage: %s <profile.log>...\n", argv[0]);
     return 1;
   }
-  parse_stats(argv[1]);
+  std::map<std::string, std::vector<std::vector<uint64_t>>> per_function_results_all;
+  for (int i = 1; i < argc; i++) {
+    parse_stats(argv[i], per_function_results_all);
+  }
+  print_results("All", per_function_results_all);
   return 0;
 }
