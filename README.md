@@ -1,7 +1,49 @@
 
 # experimentation personal library
 
+## C++ Function hardware counter profiler 
 
+
+```
+void to_profile() {
+  PbProfileFunctionF(f, __FUNCTION__, PB_PROFILE_CACHE | PB_PROFILE_BRANCH);
+  for (int i = 0; i < 1000000; i++) {
+    int *a = new int;
+    delete a;
+  }
+int main() {
+  PbProfilerStart("profile.log");
+}
+```
+### after a fio run in ceph benchmarks testing ceph's `operator new` and `operator delete`
+```
+Adding function allocate
+Adding function deallocate
+Adding function allocate
+Adding function _kv_sync_thread
+Adding function queue_transactions
+Results 2021523-ceph-osd.profile.log:
+Function _kv_sync_thread:
+                cycles: samples:               1, p50:     12236831156 p99     12236831156
+          cache_misses: samples:               1, p50:        97487290 p99        97487290
+         branch_misses: samples:               1, p50:        43208800 p99        43208800
+Function allocate:
+                cycles: samples:        12000849, p50:              90 p99             310
+          cache_misses: samples:        12000849, p50:               0 p99               7
+         branch_misses: samples:        12000847, p50:               0 p99               3
+Function allocate:
+                cycles: samples:          540740, p50:              90 p99             299
+          cache_misses: samples:          540740, p50:               0 p99               7
+         branch_misses: samples:          540742, p50:               0 p99               2
+Function deallocate:
+                cycles: samples:        12541589, p50:              95 p99             374
+          cache_misses: samples:        12541589, p50:               0 p99               4
+         branch_misses: samples:        12541589, p50:               0 p99               0
+Function queue_transactions:
+                cycles: samples:          101413, p50:         4329800 p99        10097291
+```
+
+### running tests in bluestore
 ```
 ./bin/ceph_test_objectstore --gtest_filter="ObjectStore/StoreTest.Synthetic/1" --log_to_stderr=false --log_file=log.log --debug_bluestore=30 --plugin_dir=lib
 cp profile.log ~/pb/

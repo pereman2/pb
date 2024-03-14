@@ -1,3 +1,5 @@
 #include "time_function.h"
 
-pb_profiler g_profiler;
+namespace pb_profiler {
+  pb_profiler_t g_profiler;
+}
